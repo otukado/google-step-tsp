@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <chrono>
 #include <cmath>
+#include <random>
 
 constexpr double INF = std::numeric_limits<double>::infinity();
 
@@ -24,8 +25,8 @@ struct city {
     int id;
 };
 
-uint32_t xor_shift() {
-    static uint32_t y = 2463534242;
+static uint32_t y = 2463534242;
+uint32_t xor_shift() {    
     y = y ^ (y << 13);
     y = y ^ (y >> 17);
     return y = y ^ (y << 5);
@@ -79,11 +80,10 @@ double calc_distance_squared(const point_2D& a, const point_2D& b) {
     return square(a.x - b.x) + square(a.y - b.y);
 }
 
-std::vector<std::vector<int>> nearly_city(const std::vector<city>& cities){ // 近い 15 の街の保存
+std::vector<std::vector<int>> nearly_city(const std::vector<city>& cities, int k){ // 近い 15 の街の保存
     int n = cities.size();
 
     std::vector<std::vector<int>> response(n);
-    int k = 15;
 
     for(int i=0; i<n; ++i) {
         std::vector<std::pair<double, int>> distances; //距離を保存する
@@ -213,7 +213,7 @@ public:
 namespace Neighborhood {
     
     // 2点間の距離を取得する関数
-    double get_dist(const std::vector<float>& dist_table, int u, int v, int n) {
+    double get_dist(const std::vector<double>& dist_table, int u, int v, int n) {
         return dist_table[u * n + v];
     }
 
@@ -222,7 +222,7 @@ namespace Neighborhood {
         int i, j;
         double delta;
 
-        bool prepare(const TspState& state, const std::vector<float>& dist_table, int i_idx, int j_idx, int n) {
+        bool prepare(const TspState& state, const std::vector<double>& dist_table, int i_idx, int j_idx, int n) {
             i = i_idx; j = j_idx;
             if (i == j) return false;
             if (i > j) std::swap(i, j);
@@ -247,12 +247,85 @@ namespace Neighborhood {
         }
     };
 
+    // [3-opt近傍] 3本のエッジを切り、7通りの繋ぎ替えから最適なものを選ぶ
+    struct ThreeOpt {
+        int i, j, k;
+        int pattern;
+        double delta;
+
+        bool prepare(const TspState& state, const std::vector<double>& dist_table, int i_idx, int j_idx, int k_idx, int n) {
+            // インデックスを昇順 (i < j < k) にソートする
+            int arr[3] = {i_idx, j_idx, k_idx};
+            if (arr[0] > arr[1]) std::swap(arr[0], arr[1]);
+            if (arr[1] > arr[2]) std::swap(arr[1], arr[2]);
+            if (arr[0] > arr[1]) std::swap(arr[0], arr[1]);
+            i = arr[0]; j = arr[1]; k = arr[2];
+
+            // 頂点が共有される（エッジが隣接する）ケースや長さ0の区間を排除
+            if (i == j || j == k) return false;
+            if (i + 1 == j || j + 1 == k || (k + 1) % n == i) return false;
+
+            int a = state.order[i],      b = state.order[i + 1];
+            int c = state.order[j],      d = state.order[j + 1];
+            int e = state.order[k],      f = state.order[(k + 1) % n];
+
+            // 元の3エッジの距離
+            double d_ab = get_dist(dist_table, a, b, n);
+            double d_cd = get_dist(dist_table, c, d, n);
+            double d_ef = get_dist(dist_table, e, f, n);
+            double current_dist = d_ab + d_cd + d_ef;
+
+            // 7通りの繋ぎ替えパターンの距離を計算
+            double d1 = get_dist(dist_table, a, c, n) + get_dist(dist_table, b, d, n) + d_ef; // 2-opt
+            double d2 = d_ab + get_dist(dist_table, c, e, n) + get_dist(dist_table, d, f, n); // 2-opt
+            double d3 = get_dist(dist_table, a, c, n) + get_dist(dist_table, b, e, n) + get_dist(dist_table, d, f, n); // 3-opt
+            double d4 = get_dist(dist_table, a, d, n) + get_dist(dist_table, e, b, n) + get_dist(dist_table, c, f, n); // 3-opt
+            double d5 = get_dist(dist_table, a, d, n) + get_dist(dist_table, e, c, n) + get_dist(dist_table, b, f, n); // 3-opt
+            double d6 = get_dist(dist_table, a, e, n) + get_dist(dist_table, d, b, n) + get_dist(dist_table, c, f, n); // 3-opt
+            double d7 = get_dist(dist_table, a, e, n) + d_cd + get_dist(dist_table, b, f, n); // 2-opt (全体反転)
+
+            // SAなので、7パターンのうち「最も delta が小さいもの」をこの遷移の代表とする
+            double min_d = d1; pattern = 1;
+            if (d2 < min_d) { min_d = d2; pattern = 2; }
+            if (d3 < min_d) { min_d = d3; pattern = 3; }
+            if (d4 < min_d) { min_d = d4; pattern = 4; }
+            if (d5 < min_d) { min_d = d5; pattern = 5; }
+            if (d6 < min_d) { min_d = d6; pattern = 6; }
+            if (d7 < min_d) { min_d = d7; pattern = 7; }
+
+            delta = min_d - current_dist;
+            return true;
+        }
+
+        void apply(TspState& state) const {
+            auto it1 = state.order.begin() + i + 1;
+            auto it2 = state.order.begin() + j + 1;
+            auto it3 = state.order.begin() + k + 1;
+
+            // C++の標準関数 (reverse と rotate) を使えば、どんな複雑な3-optの繋ぎ替えも
+            // 補助配列なしでインプレース（メモリ確保ゼロ）で超高速に実現できる
+            if (pattern == 1)      { std::reverse(it1, it2); }
+            else if (pattern == 2) { std::reverse(it2, it3); }
+            else if (pattern == 3) { std::reverse(it1, it2); std::reverse(it2, it3); }
+            else if (pattern == 4) { std::rotate(it1, it2, it3); }
+            else if (pattern == 5) { std::reverse(it1, it2); std::rotate(it1, it2, it3); }
+            else if (pattern == 6) { std::reverse(it2, it3); std::rotate(it1, it2, it3); }
+            else if (pattern == 7) { std::reverse(it1, it3); }
+
+            // 影響を受けた区間のpos(逆引き)を更新
+            for (int x = i + 1; x <= k; ++x) {
+                state.pos[state.order[x]] = x;
+            }
+            state.current_dist += delta;
+        }
+    };
+
     // i と j を入れ替え
     struct Swap {
         int i, j;
         double delta;
 
-        bool prepare(const TspState& state, const std::vector<float>& dist_table, int i_idx, int j_idx) {
+        bool prepare(const TspState& state, const std::vector<double>& dist_table, int i_idx, int j_idx) {
             i = i_idx; j = j_idx;
             if (i == j) return false;
 
@@ -289,7 +362,7 @@ namespace Neighborhood {
         int i, j;
         double delta;
 
-        bool prepare(const TspState& state, const std::vector<float>& dist_table, int i_idx, int j_idx) {
+        bool prepare(const TspState& state, const std::vector<double>& dist_table, int i_idx, int j_idx) {
             i = i_idx; j = j_idx;
             if (i == j || j == (i - 1 + state.n) % state.n) return false;
 
@@ -318,13 +391,78 @@ namespace Neighborhood {
     };
 }
 
-std::vector<int> solve_tsp(const std::vector<city>& cities, std::vector<std::vector<int>>& candidates, int limit){
+double calc_initial_temp(const TspState& state, const std::vector<double>& dist_table, const std::vector<std::vector<int>>& candidates, int n, 
+     int ratio_2opt, int ratio_3opt, int ratio_swap, int ratio_insert, double target_prob = 0.6) {
+    int sample_count = 0;
+    double sum_delta = 0.0;
+    
+    Neighborhood::TwoOpt n_2opt;
+    Neighborhood::ThreeOpt n_3opt;
+    Neighborhood::Swap n_swap;
+    Neighborhood::Insert n_insert;
+
+    const double neighbor_prob = 0.80; // 本番スタート時の確率に合わせる
+
+    for (int iter = 0; iter < 1000; ++iter) {
+        // 1. 本番と全く同じルールで i, j, k を選ぶ
+        int i = xor_shift() % n;
+        int j;
+        int u_current = state.order[i];
+        if (rnd() < neighbor_prob && !candidates[u_current].empty()) {
+            int idx = static_cast<int>(rnd() * rnd() * candidates[u_current].size());
+            j = state.pos[candidates[u_current][idx]];
+        } else {
+            j = xor_shift() % n;
+        }
+
+        int k;
+        int v_current = state.order[j];
+        if (rnd() < neighbor_prob && !candidates[v_current].empty()) {
+            int idx = static_cast<int>(rnd() * candidates[v_current].size());
+            k = state.pos[candidates[v_current][idx]];
+        } else {
+            k = xor_shift() % n;
+        }
+        
+        bool is_valid = false;
+        int op = xor_shift() % (ratio_2opt + ratio_3opt + ratio_swap + ratio_insert);
+        int bound_3opt = ratio_2opt + ratio_3opt;
+        int bound_swap = bound_3opt + ratio_swap;
+        double delta = 0;
+
+        if (op < ratio_2opt) {
+            is_valid = n_2opt.prepare(state, dist_table, i, j, n);
+            delta = n_2opt.delta;
+        } else if(op < bound_3opt) {
+            is_valid = n_3opt.prepare(state, dist_table, i, j, k, n);
+            delta = n_3opt.delta;
+        } else if (op < bound_swap) {
+            is_valid = n_swap.prepare(state, dist_table, i, j);
+            delta = n_swap.delta;
+        } else {
+            is_valid = n_insert.prepare(state, dist_table, i, j);
+            delta = n_insert.delta;
+        }
+
+        if (is_valid && delta > 1e-6) {
+            sum_delta += delta;
+            sample_count++;
+        }
+    }
+
+    if (sample_count == 0) return 30.0; // 実際より小さめのフェイルセーフ値に調整
+    
+    double avg_delta = sum_delta / sample_count;
+    return -avg_delta / std::log(target_prob);
+}
+
+std::vector<int> solve_tsp(const std::vector<city>& cities, std::vector<std::vector<int>>& candidates, int limit, int ratio_2opt, int ratio_3opt, int ratio_swap, int ratio_insert, double target_prob){
     auto init_order = two_opt(cities, greedy_order(cities)); // 初期解は greedy + 2-opt
     TspState state(init_order, cities);
 
     int n = cities.size();
 
-    std::vector<float> dist_table(n*n); // 各ノードの距離を前計算
+    std::vector<double> dist_table(n*n); // 各ノードの距離を前計算
     for (int i=0; i<n; ++i) {
         for (int j = 0; j < n; ++j) {
             dist_table[i * n + j] = std::sqrt(calc_distance_squared(cities[i].position, cities[j].position));
@@ -335,57 +473,80 @@ std::vector<int> solve_tsp(const std::vector<city>& cities, std::vector<std::vec
     };
 
     Timer timer;
-    const int TIME_LIMIT_MS = limit * 60 * 1000; // limit 分行う
+    const int TIME_LIMIT_MS = limit * 1000; // limit 秒行う
 
     std::vector<int> best_order = state.order;
     double best_dist = state.current_dist;
 
-    // 初期温度の計算
-    double sum_delta = 0.0;
-    int sample_count = 0;
-    for (int k = 0; k < 2000; ++k) {
-        int i = xor_shift() % n, j = xor_shift() % n;
-        Neighborhood::TwoOpt op;
-        if (op.prepare(state, dist_table, i, j, n) && op.delta > 0) {
-            sum_delta += op.delta; sample_count++;
-        }
-    }
-    double start_temp = -(sum_delta / (sample_count > 0 ? sample_count : 1)) / std::log(0.3);
-    
+    const double start_temp = calc_initial_temp(state, dist_table, candidates, n, ratio_2opt, ratio_3opt, ratio_swap, ratio_insert, target_prob);
+    const double end_temp = 0.01;
+
+
     // 初期化
-    CoolingScheduler scheduler(start_temp, 0.01, TIME_LIMIT_MS);
+    CoolingScheduler scheduler(start_temp, end_temp, TIME_LIMIT_MS);
     long long iteration_count = 0;
 
     // 各近傍操作インスタンス
     Neighborhood::TwoOpt n_2opt;
+    Neighborhood::ThreeOpt n_3opt;
     Neighborhood::Swap n_swap;
     Neighborhood::Insert n_insert;
     double current_temp = start_temp;
+    double neighbor_prob = 0.80;
+
     while(true) {
         if ((iteration_count & 4095) == 0) { // 時間管理
             if (timer.elapsed_ms() > TIME_LIMIT_MS) break;
             current_temp = scheduler.get_temperature(timer.elapsed_ms());
+            double progress = static_cast<double>(timer.elapsed_ms()) / TIME_LIMIT_MS;
+            neighbor_prob = 0.80 + 0.20 * std::min(1.0, progress);
+
+            double true_dist = 0.0;
+            for (int i=0; i<n; ++i) {
+                true_dist += get_dist(state.order[i], state.order[(i + 1) % n]);
+            }
+            state.current_dist = true_dist;
         }
+        
 
         // 遷移先は、近傍または完全にランダム
         int i = xor_shift() % n;
-        int j = 0;
+        int j;
         int u_current = state.order[i];
-        if (rnd() < 0.9 && !candidates[u_current].empty()) {
-            j = state.pos[candidates[u_current][xor_shift() % candidates[u_current].size()]];
+        if (rnd() < neighbor_prob && !candidates[u_current].empty()) {
+            int idx = static_cast<int>(rnd() * rnd() * candidates[u_current].size());
+            j = state.pos[candidates[u_current][idx]];
         } else {
             j = xor_shift() % n;
         }
+        int k;
+        int v_current = state.order[j];
+        if (rnd() < neighbor_prob && !candidates[v_current].empty()) {
+            int idx = static_cast<int>(rnd() * candidates[v_current].size());
+            k = state.pos[candidates[v_current][idx]];
+        } else {
+            k = xor_shift() % n;
+        }
 
-        // ランダムに操作を決定する
-        int op = xor_shift() % 10;
+        // // ランダムに操作を決定する
+        // int ratio_2opt = 70;
+        // int ratio_3opt = 5;
+        // int ratio_swap = 15;
+        // int ratio_insert = 10;
+        int op = xor_shift() % (ratio_2opt + ratio_3opt + ratio_swap + ratio_insert);
+        int bound_3opt = ratio_2opt + ratio_3opt;
+        int bound_swap = bound_3opt + ratio_swap;
+
         double delta = 0;
         bool is_valid = false;
 
-        if (op < 7) {
+        if (op < ratio_2opt) {
             is_valid = n_2opt.prepare(state, dist_table, i, j, n);
             delta = n_2opt.delta;
-        } else if (op < 9) {
+        } else if(op < bound_3opt) {
+            is_valid = n_3opt.prepare(state, dist_table, i, j, k, n);
+            delta = n_3opt.delta;
+        } else if (op < bound_swap) {
             is_valid = n_swap.prepare(state, dist_table, i, j);
             delta = n_swap.delta;
         } else {
@@ -397,8 +558,9 @@ std::vector<int> solve_tsp(const std::vector<city>& cities, std::vector<std::vec
 
         // apply するかどうか
         if (delta <= 0 || rnd() < std::exp(-delta / current_temp)) {
-            if (op < 7) n_2opt.apply(state);
-            else if (op < 9) n_swap.apply(state);
+            if (op < ratio_2opt) n_2opt.apply(state);
+            else if(op < bound_3opt) n_3opt.apply(state);
+            else if (op < bound_swap) n_swap.apply(state);
             else n_insert.apply(state);
 
             if (state.current_dist < best_dist) { //ベストスコアの更新
@@ -408,7 +570,7 @@ std::vector<int> solve_tsp(const std::vector<city>& cities, std::vector<std::vec
         }
         iteration_count++;
     }
-    std::cout << iteration_count << '\n';
+    // std::cout << iteration_count << '\n';
 
     return two_opt(cities, best_order);
 }
@@ -422,16 +584,58 @@ void output_answer(const std::vector<int>& answer, const std::string& output_fil
 }
 
 int main() {
-    std::array<int, 2> minutes = {5, 10};
+    int r_2opt = 35, r_3opt = 26, r_swap = 2, r_insert = 18, k = 9, targe_prob = 0.128;
+    std::random_device rd;
+    y = rd();
+    std::array<int, 2> minutes = {180, 60};
     for(int i=6; i<=7; ++i) {
         std::string input_file_name = std::format("./input_{}.csv", i);
         std::string output_file_name = std::format("./output_{}.csv", i);
 
         std::vector<city> cities = read_cities(input_file_name); // 全ての街の座標が順に入っている
-        std::vector<std::vector<int>> candidates = nearly_city(cities); // 上位15個の近傍の街が入っている
-        std::vector<int> order_of_cities = solve_tsp(cities, candidates, minutes[i-6]); // TSP を解く
+        std::vector<std::vector<int>> candidates = nearly_city(cities, k); // 上位40個の近傍の街が入っている
+        double best_score = 43000.0;
+        std::vector<int> order_of_cities;
+        for(int i=0; i<5; ++i) {
+            if()
+        }
+        std::vector<int> order_of_cities = solve_tsp(cities, candidates, minutes[i-6], 35, 26, 2,18, 0.128); // TSP を解く
         output_answer(order_of_cities, output_file_name); // 出力する
 
         std::cout << i << std::endl;
     }
 }
+
+// int main(int argc, char* argv[]) {
+//     // デフォルト値
+//     int r_2opt = 70, r_3opt = 5, r_swap = 15, r_insert = 10, k = 15;
+//     double target_prob = 300.0;
+    
+//     // コマンドライン引数があれば上書き
+//     if (argc >= 7) {
+//         r_2opt   = std::stoi(argv[1]);
+//         r_3opt   = std::stoi(argv[2]);
+//         r_swap   = std::stoi(argv[3]);
+//         r_insert = std::stoi(argv[4]);
+//         k = std::stoi(argv[5]);
+//         target_prob = std::stod(argv[6]);
+//     }
+
+//     std::random_device rd;
+//     y = rd();
+    
+//     // チューニング時は評価を高速化するため、ファイル1つ（1分）だけでテストするのがおすすめ
+//     std::string input_file_name = "./input_7.csv"; 
+//     std::vector<city> cities = read_cities(input_file_name);
+//     std::vector<std::vector<int>> candidates = nearly_city(cities, k);
+    
+//     // TSPを解く (10秒間)
+//     std::vector<int> order_of_cities = solve_tsp(cities, candidates, 30, r_2opt, r_3opt, r_swap, r_insert, target_prob);
+    
+//     // 最終的な「本当の総距離」を計算して、標準出力にそれ「だけ」を出す
+//     double final_dist = calc_total_distance(cities, order_of_cities);
+//     std::cerr <<final_dist << std::endl;
+//     std::cout << final_dist << std::endl; 
+
+//     return 0;
+// }
